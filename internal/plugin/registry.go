@@ -17,6 +17,9 @@ type MessageHandler = runtime.MessageHandler
 // NoticeHandler 通知 hook.
 type NoticeHandler = runtime.NoticeHandler
 
+// RequestHandler 请求事件 hook.
+type RequestHandler = runtime.RequestHandler
+
 // commandEntry.
 type commandEntry struct {
 	Name     string
