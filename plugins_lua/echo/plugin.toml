@@ -1,0 +1,7 @@
+name = "echo"
+version = "1.0.0"
+author = "NeoBot Team"
+description = "复读机插件"
+usage = "/echo <消息>"
+permission = "user"
+runtime = "lua"

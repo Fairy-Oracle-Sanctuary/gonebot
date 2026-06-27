@@ -1,0 +1,13 @@
+name = "pywebfetch"
+version = "1.0.0"
+author = "NeoBot Team"
+description = "Python 插件示例: 使用 requests 拉取网页标题"
+usage = "/pyfetch <url>"
+permission = "user"
+runtime = "python"
+
+[dependencies]
+python = ["requests>=2.31"]
+
+[config]
+timeout = 10

@@ -1,0 +1,10 @@
+name = "hello"
+version = "1.0.0"
+author = "NeoBot Team"
+description = "简单示例插件"
+usage = "/hello <名字>"
+permission = "user"
+runtime = "lua"
+
+[config]
+greeting = "你好"

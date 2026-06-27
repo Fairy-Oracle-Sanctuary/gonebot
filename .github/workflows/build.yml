@@ -1,0 +1,115 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ---- CI: 编译检查 + 测试 (单平台, 快速) ----
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build (linux)
+        run: go build -o neobot ./cmd/neobot
+
+  # ---- Release: 多平台交叉编译 (仅 tag 触发) ----
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [windows, linux, darwin]
+        goarch: [amd64, arm64]
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Set output name
+        id: vars
+        shell: bash
+        run: |
+          GOOS=${{ matrix.goos }}
+          GOARCH=${{ matrix.goarch }}
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          echo "binary=neobot-${GOOS}-${GOARCH}${EXT}" >> $GITHUB_OUTPUT
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w -X 'main.version=${{ github.ref_name }}'" \
+            -o "${{ steps.vars.outputs.binary }}" \
+            ./cmd/neobot
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.vars.outputs.binary }}
+          path: ${{ steps.vars.outputs.binary }}
+
+  # ---- 汇总所有平台产物并创建 Release ----
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## 下载
+
+            | 平台 | 文件 | SHA256 |
+            |---|---|---|
+            | Windows 64-bit | `neobot-windows-amd64.exe` | 见 `checksums.txt` |
+            | Linux 64-bit | `neobot-linux-amd64` | 见 `checksums.txt` |
+            | Linux ARM64 | `neobot-linux-arm64` | 见 `checksums.txt` |
+            | macOS Intel | `neobot-darwin-amd64` | 见 `checksums.txt` |
+            | macOS Apple Silicon | `neobot-darwin-arm64` | 见 `checksums.txt` |
+
+            ## 使用
+
+            1. 下载对应平台的二进制文件
+            2. 复制 `config.toml.example` 为 `config.toml` 并编辑
+            3. 运行二进制文件:
+               - Windows: `.\neobot-windows-amd64.exe`
+               - Linux/macOS: `chmod +x neobot-* && ./neobot-linux-amd64`
+          files: dist/*
+          draft: false
+          prerelease: false

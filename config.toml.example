@@ -1,0 +1,71 @@
+[bot]
+self_id = 123456
+nickname = "NEO Bot"
+command_prefix = ["/", "!", "＃"]
+ignore_self_message = true
+superusers = [123456]
+
+[napcat_ws]
+uri = "ws://127.0.0.1:30001"
+token = ""
+reconnect_interval = 5
+heartbeat_interval = 30
+api_request_timeout = 30
+
+[reverse_ws]
+enabled = false
+host = "0.0.0.0"
+port = 8080
+token = ""
+
+[redis]
+addr = "127.0.0.1:6379"
+password = ""
+db = 0
+pool_size = 20
+
+[mysql]
+dsn = ""
+max_open = 20
+max_idle = 5
+max_life_minutes = 30
+
+[logging]
+level = "info"
+output = "stdout"
+file = "./logs/neobot.log"
+max_size_mb = 100
+max_backups = 7
+
+[browser]
+enabled = false
+pool_size = 3
+chromium_path = ""
+headless = true
+
+[image]
+width = 800
+quality = 90
+timeout_sec = 30
+
+[plugins]
+[plugins.lua]
+enabled = true
+dir = "plugins_lua"
+max_memory_mb = 64
+max_cpu_sec = 5
+
+[plugins.python]
+enabled = false
+dir = "plugins_py"
+python_bin = "python3"
+shim_path = "shim/pyplugin_host.py"
+
+# 依赖管理配置 (阶段 1)
+[plugins.deps]
+enabled = true
+python_bin = "python3"
+# pip_index = "https://pypi.tuna.tsinghua.edu.cn/simple/"  # 清华源
+# pip_extra_args = []
+cache_dir = "./data/plugin_deps"
+timeout_sec = 300

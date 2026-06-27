@@ -1,0 +1,48 @@
+# ---- 编译产物 ----
+neobot.exe
+neobot
+*.exe~
+
+# ---- Go ----
+*.test
+*.out
+vendor/
+
+# ---- Python 运行时 ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# ---- Python venv & 依赖 ----
+plugins_py/.venv/
+plugins_py/**/venv/
+**/.nb_venv.json
+**/.nb_reqs.txt
+pip-log.txt
+
+# ---- 配置文件 (含敏感信息) ----
+config.toml
+
+# ---- 日志 ----
+logs/
+*.log
+
+# ---- 数据 / 缓存 ----
+data/
+.cache/
+
+# ---- IDE / 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/

@@ -1,0 +1,14 @@
+name = "greeter"
+version = "1.0.0"
+author = "NeoBot Team"
+description = "Lua 插件示例: 使用本地 lib 工具"
+usage = "/greeter <名字>"
+permission = "user"
+runtime = "lua"
+
+[dependencies]
+lua = ["string-utils"]
+local = ["./lib"]
+
+[config]
+greeting = "你好"

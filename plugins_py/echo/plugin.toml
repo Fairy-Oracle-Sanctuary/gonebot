@@ -1,0 +1,7 @@
+name = "pyecho"
+version = "1.0.0"
+author = "NeoBot Team"
+description = "Python 示例插件: 复读机"
+usage = "/pyecho <msg>"
+permission = "user"
+runtime = "python"
