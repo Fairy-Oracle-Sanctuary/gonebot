@@ -6,6 +6,12 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "是否创建 Release (等同于推送 tag)"
+        type: boolean
+        default: false
 
 jobs:
   # ---- CI: 编译检查 + 测试 (单平台, 快速) ----
@@ -29,7 +35,7 @@ jobs:
 
   # ---- Release: 多平台交叉编译 (仅 tag 触发) ----
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
     needs: check
     runs-on: ubuntu-latest
     strategy:
@@ -73,7 +79,7 @@ jobs:
 
   # ---- 汇总所有平台产物并创建 Release ----
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
     needs: release
     runs-on: ubuntu-latest
     permissions:
