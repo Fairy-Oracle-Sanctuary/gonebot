@@ -1,6 +1,6 @@
 # ---- 编译产物 ----
-neobot.exe
-neobot
+/neobot.exe
+/neobot
 *.exe~
 
 # ---- Go ----
