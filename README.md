@@ -4,7 +4,7 @@
 
 ## 特性
 
-- **多运行时支持** — Lua 插件（嵌入式 VM）和 Python 插件（独立子进程）
+- **三层插件架构** — Layer 1 Go 核心框架 + Layer 2 Python 子进程 + Layer 3 Lua 嵌入式脚本，各司其职
 - **OneBot v11 兼容** — 正向/反向 WebSocket 连接，兼容 NapCat、LLOneBot 等实现
 - **命令系统** — 注册命令 + 别名 + 三级权限（user / admin / superuser）
 - **事件 Hook** — 全局消息 hook、通知 hook（群成员增减、群文件上传等）
@@ -12,6 +12,55 @@
 - **依赖管理** — Python 插件自动安装 pip 依赖（支持 venv 隔离）；Lua 插件支持本地库引用
 - **服务集成** — 内置 Redis、MySQL、浏览器渲染（HTML 转图片）可选服务
 - **图片渲染** — 浏览器池支持 HTML/URL/Template 转图片，直接作为消息发送
+
+## 三层插件架构
+
+NeoBot 采用从底层到上层的三层架构，每一层服务于不同的开发场景：
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Layer 1 — Go Native Core (核心框架)                   │
+│  Registry │ Manager │ Router │ Watcher │ Host       │
+│  编译进二进制，提供插件运行所需的全部基础设施               │
+├─────────────────────────────────────────────────────┤
+│  Layer 2 — Python Runtime │ Layer 3 — Lua Runtime    │
+│  独立子进程 + JSON-RPC     │ 嵌入式 gopher-lua VM     │
+│  venv 隔离 + pip 依赖      │ 零序列化 + require()     │
+└─────────────────────────────────────────────────────┘
+```
+
+| 层级 | 运行时 | 隔离方式 | 通信 | 适用场景 |
+|------|--------|----------|------|----------|
+| **Layer 1** | Go 原生 | 无（框架本体） | 直接调用 | 核心功能扩展、高性能模块 |
+| **Layer 2** | Python 子进程 | 独立进程 + venv | JSON-RPC/stdio | AI/ML、网络请求、复杂业务 |
+| **Layer 3** | Lua 嵌入式 VM | 独立 VM 实例 | Go 闭包直接调用 | 轻量命令、快速原型、热更新 |
+
+### Layer 1 — Go Native Core
+
+核心框架**直接编译进 `neobot` 二进制**，提供：
+
+- **Registry** — 线程安全的命令/事件注册表，Layer 2 和 Layer 3 的插件最终都注册到这里
+- **Manager** — 扫描 `plugins_lua/` 和 `plugins_py/` 目录，解析 `plugin.toml`，按 `runtime` 字段分派
+- **Router** — 事件入口：消息 → MessageHook → 命令查表 → Handler
+- **Watcher** — fsnotify 监听文件变更，500ms 防抖热重载
+- **Host** — 依赖注入容器（Bot API / 权限 / Redis / MySQL / 渲染 / 事件上下文）
+
+核心代码位于 `internal/plugin/`，通过 `Runtime` 接口 ([runtime.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/runtime/runtime.go)) 连接 Layer 2 和 Layer 3。
+
+### Layer 2 — Python 运行时
+
+- 插件放在 `plugins_py/<name>/`，包含 `plugin.toml`（`runtime = "python"`）和 `plugin.py`
+- 每个插件**独立子进程**，崩溃不影响其他插件
+- **JSON-RPC over stdio** 与 Go 主进程通信
+- **venv 虚拟环境**隔离 pip 依赖，支持 `uv` 加速
+- 通过 `neobot_sdk` 包使用 `@command` / `@on_message` / `@on_notice` 装饰器
+
+### Layer 3 — Lua 运行时
+
+- 插件放在 `plugins_lua/<name>/`，包含 `plugin.toml`（`runtime = "lua"`）和 `plugin.lua`
+- 每个插件**独立 `gopher-lua` VM**，轻量且零序列化开销
+- SDK 以全局变量 `neobot`（`neobot.bot` / `neobot.register` / `neobot.seg` 等）注入
+- 支持 `require()` 加载 `lib/` 目录下的本地 Lua 库
 
 ## 项目结构
 

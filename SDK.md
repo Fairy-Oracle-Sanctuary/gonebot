@@ -20,48 +20,74 @@ NeoBot Go 是多运行时 QQ 机器人框架的 SDK 文档，涵盖 Lua 和 Pyth
 
 ## 架构概览
 
+NeoBot 采用**三层插件架构**，从底层到上层依次为：Go 原生核心框架、Python 子进程运行时、Lua 嵌入式脚本运行时。
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    NeoBot Go (主进程)                       │
-│                                                         │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐         │
-│  │ WS Client│  │  Bot     │  │  Permission   │         │
-│  │ (NapCat) │  │ (API聚合)│  │  (三级权限)    │         │
-│  └────┬─────┘  └────┬─────┘  └───────┬───────┘         │
-│       │             │               │                   │
-│  ┌────┴─────────────┴───────────────┴────────────────┐  │
-│  │                   Router (事件分发)                  │  │
-│  │  Message → MessageHooks → CommandLookup → Handler │  │
-│  │  Notice  → NoticeHooks                            │  │
-│  └─────────────┬─────────────────────────────────────┘  │
-│                │                                        │
-│  ┌─────────────┴─────────────────────────────────────┐  │
-│  │             Plugin Manager                        │  │
-│  │  ┌──────────────┐  ┌──────────────────────┐      │  │
-│  │  │ Lua Runtime  │  │  Python Runtime       │      │  │
-│  │  │ (嵌入式 VM)   │  │  (独立子进程)          │      │  │
-│  │  │              │  │  JSON-RPC over stdio  │      │  │
-│  │  └──────────────┘  └──────────────────────┘      │  │
-│  └──────────────────────────────────────────────────┘  │
-│                                                         │
-│  可选服务: Redis │ MySQL │ Browser(渲染)                   │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                      NeoBot Go (主进程)                            │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │               Layer 1 — Go Native Core (核心框架)            │  │
+│  │                                                            │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌───────────────┐            │  │
+│  │  │ WS Client│  │  Bot     │  │  Permission   │            │  │
+│  │  │ (NapCat) │  │ (API聚合)│  │  (三级权限)    │            │  │
+│  │  └────┬─────┘  └────┬─────┘  └───────┬───────┘            │  │
+│  │       │             │               │                      │  │
+│  │  ┌────┴─────────────┴───────────────┴────────────────┐     │  │
+│  │  │              Router (事件分发)                      │     │  │
+│  │  │  Message → MessageHooks → CommandLookup → Handler │     │  │
+│  │  │  Notice  → NoticeHooks                            │     │  │
+│  │  └──────────────────────┬────────────────────────────┘     │  │
+│  │                         │                                  │  │
+│  │  ┌──────────────────────┴────────────────────────────┐     │  │
+│  │  │  Plugin Manager  ─── Registry ─── File Watcher    │     │  │
+│  │  │  (扫描目录 / 元数据解析 / 运行时调度 / 热重载)        │     │  │
+│  │  └──────┬──────────────────────────────────┬────────┘     │  │
+│  └─────────┼──────────────────────────────────┼──────────────┘  │
+│            │                                  │                 │
+│  ┌─────────┴────────┐              ┌──────────┴──────────┐      │
+│  │ Layer 2           │              │ Layer 3              │      │
+│  │ Python Runtime    │              │ Lua Runtime          │      │
+│  │ (JSON-RPC/stdio)  │              │ (嵌入式 gopher-lua)   │      │
+│  │                   │              │                      │      │
+│  │ 子进程 × N        │              │ VM × N               │      │
+│  │ venv 隔离         │              │ 零序列化开销          │      │
+│  │ pip 依赖管理      │              │ require() 本地库      │      │
+│  └───────────────────┘              └──────────────────────┘      │
+│                                                                  │
+│  可选服务: Redis │ MySQL │ Browser(HTML→图片渲染)                   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### Lua 运行时
+### Layer 1 — Go Native Core（核心框架层）
 
-- 每个插件一个独立的 `gopher-lua` VM 实例 ([lua.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/runtime/lua.go))
-- SDK 以全局变量 `neobot` 注入到 VM 中 ([lua_sdk.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/runtime/lua_sdk.go))
-- 注册的命令和 Hook 通过 Go 闭包桥接到 Registry
-- 支持本地 Lua 库引用（通过 `[dependencies].local`）
+这是直接编译进 `neobot` 二进制的 Go 代码，是插件的**运行基石**，而非插件本身。它提供：
 
-### Python 运行时
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| **Registry** | [registry.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/registry.go) | 统一的命令/事件注册表，线程安全 |
+| **Manager** | [manager.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/manager.go) | 扫描插件目录，解析 `plugin.toml`，按 `runtime` 字段调度到对应运行时 |
+| **Router** | [router.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/router.go) | 事件入口：消息先走 MessageHook，再查命令表；Notice 走 NoticeHook |
+| **Watcher** | [watcher.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/watcher.go) | fsnotify 监听 `.lua` / `.toml` 变更，500ms 防抖自动热重载 |
+| **Host** | [runtime/runtime.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/runtime/runtime.go) | 依赖注入容器：Bot API、Perm、Redis、MySQL、Render、EventCtx |
+| **Deps** | [deps/manager.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/deps/manager.go) | pip 依赖安装 + Lua 本地库校验 |
 
-- 每个插件一个独立的 Python 子进程 ([pythonproc/proc.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/pythonproc/proc.go))
-- 通信协议: JSON-RPC over stdio
-- Host 脚本: [pyplugin_host.py](file:///c:/Users/yello/Documents/gonebot/shim/pyplugin_host.py)
-- SDK 包: `neobot_sdk` ([__init__.py](file:///c:/Users/yello/Documents/gonebot/shim/neobot_sdk/__init__.py), [plugin.py](file:///c:/Users/yello/Documents/gonebot/shim/neobot_sdk/plugin.py))
-- 支持 venv 虚拟环境隔离
+### Layer 2 — Python Runtime（Python 子进程层）
+
+- 每个插件**一个独立子进程**，重启不影响其他插件
+- 通信协议：**JSON-RPC over stdio**（stdin/stdout 逐行 JSON）
+- 使用 **venv 虚拟环境**隔离依赖，支持 `uv` 加速安装
+- Go 侧入口：[python.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/runtime/python.go) → 子进程管理：[pythonproc/proc.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/pythonproc/proc.go)
+- Python 侧宿主：[pyplugin_host.py](file:///c:/Users/yello/Documents/gonebot/shim/pyplugin_host.py)
+- SDK 包：[neobot_sdk/](file:///c:/Users/yello/Documents/gonebot/shim/neobot_sdk/) （`Plugin` 基类 + 装饰器）
+
+### Layer 3 — Lua Runtime（Lua 嵌入式脚本层）
+
+- 每个插件**一个独立 `gopher-lua` VM**，在 Go 进程内执行
+- SDK 以全局变量 `neobot` 注入到 VM 中（[lua_sdk.go](file:///c:/Users/yello/Documents/gonebot/internal/plugin/runtime/lua_sdk.go)）
+- 注册的命令/Hook 通过 **Go 闭包**桥接到 Registry，**零序列化开销**
+- 支持 `require()` 加载本地 Lua 库（通过 `[dependencies].local`）
 
 ---
 
