@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pyplugin_host - Python 插件 shim (独立子进程模式).
 
-通信: JSON-RPC over stdio
+通信: 帧协议 over stdio — 4 字节大端长度前缀 + JSON payload.
 
 Python 插件通过 SDK 调用 Go 端 API:
   sdk.bot.send_private_msg(123, "hello")
@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import struct
 import sys
 import threading
 import traceback
@@ -38,24 +39,54 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 
+# 帧协议常量
+FRAME_HEADER_SIZE = 4      # 4 字节大端 uint32
+FRAME_MAX_SIZE = 64 * 1024 * 1024  # 64MB 硬上限
 
-# ---- 同步 stdout writer ----
+
+# ---- 帧 I/O ----
+
+def pack_frame(payload: bytes) -> bytes:
+    """打包一帧: [4 字节长度][payload]"""
+    return struct.pack(">I", len(payload)) + payload
+
+
+def write_frame(stream, payload: bytes) -> None:
+    """向 stream 写入一帧."""
+    stream.buffer.write(pack_frame(payload))
+    stream.buffer.flush()
+
+
+def read_frame(stream) -> bytes:
+    """从 stream 读取一帧, 返回 payload 字节."""
+    header = stream.buffer.read(FRAME_HEADER_SIZE)
+    if not header or len(header) < FRAME_HEADER_SIZE:
+        return b""
+    length = struct.unpack(">I", header)[0]
+    if length > FRAME_MAX_SIZE:
+        raise ValueError(f"frame too large: {length}")
+    data = stream.buffer.read(length)
+    if len(data) < length:
+        raise EOFError("incomplete frame")
+    return data
+
+
+# ---- SyncWriter: 线程安全的帧写入 ----
 
 class SyncWriter:
     def __init__(self, stream) -> None:
         self._stream = stream
         self._lock = threading.Lock()
 
-    def write(self, data: bytes) -> None:
+    def send_frame(self, data: bytes) -> None:
         with self._lock:
             try:
-                self._stream.buffer.write(data)
-                self._stream.buffer.flush()
+                write_frame(self._stream, data)
             except Exception:
                 pass
 
 
-# ---- StdioRPC: JSON-RPC over stdio ----
+# ---- StdioRPC: 帧协议 over stdio ----
 
 class StdioRPC:
     def __init__(self) -> None:
@@ -75,14 +106,15 @@ class StdioRPC:
 
         def _read_stdin() -> None:
             try:
-                buf = sys.stdin.buffer
                 while self._running:
-                    line = buf.readline()
-                    if not line:
+                    data = read_frame(sys.stdin)
+                    if not data:
                         break
-                    loop.call_soon_threadsafe(self._reader.feed_data, line)
-            except Exception:
+                    loop.call_soon_threadsafe(self._reader.feed_data, data)
+            except (EOFError, BrokenPipeError, OSError):
                 pass
+            except Exception as e:
+                logger.debug(f"stdin read error: {e}")
             finally:
                 loop.call_soon_threadsafe(self._reader.feed_eof)
 
@@ -95,9 +127,9 @@ class StdioRPC:
             msg["params"] = params
         if msg_id is not None:
             msg["id"] = msg_id
-        line = json.dumps(msg, ensure_ascii=False) + "\n"
+        payload = json.dumps(msg, ensure_ascii=False).encode("utf-8")
         if self._writer:
-            self._writer.write(line.encode("utf-8"))
+            self._writer.send_frame(payload)
 
     def call(self, method: str, params: Any = None, timeout: float = 30.0) -> Any:
         with self._pending_lock:
@@ -134,12 +166,12 @@ class StdioRPC:
     async def read_loop(self, handler: "MessageHandler") -> None:
         assert self._reader is not None
         while True:
-            line = await self._reader.readline()
-            if not line:
+            data = await self._reader.read(FRAME_MAX_SIZE)
+            if not data:
                 logger.info("stdin closed, exiting")
                 return
             try:
-                msg = json.loads(line.decode("utf-8"))
+                msg = json.loads(data.decode("utf-8"))
             except json.JSONDecodeError as e:
                 logger.warning(f"bad json: {e}")
                 continue
@@ -334,7 +366,6 @@ class PluginRegistry:
         if meta is None:
             meta = {}
 
-        # 确保插件所在目录的父目录在 sys.path (用于 neobot_sdk import)
         parent = root.parent
         if str(parent) not in sys.path:
             sys.path.insert(0, str(parent))
@@ -346,7 +377,6 @@ class PluginRegistry:
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
 
-        # 发现 Plugin 实例: 优先 isinstance 检查, 兜底旧名字
         instance = self._discover_instance(module, root.name)
 
         # 调用初始化钩子
@@ -355,19 +385,17 @@ class PluginRegistry:
             try:
                 result = init_fn()
                 if inspect.iscoroutine(result):
-                    import asyncio as _asyncio
                     try:
-                        loop = _asyncio.get_running_loop()
+                        loop = asyncio.get_running_loop()
                     except RuntimeError:
                         loop = None
                     if loop is not None:
-                        _asyncio.ensure_future(result)
+                        asyncio.ensure_future(result)
                     else:
                         logger.warning("on_init is async but no running loop")
             except Exception as e:
                 logger.warning(f"on_init failed: {e}")
 
-        # 扫描命令和 Hook
         spec_obj = PluginSpec(
             name=meta.get("name", root.name),
             module=module,
@@ -401,8 +429,6 @@ class PluginRegistry:
         return spec_obj
 
     def _discover_instance(self, module: Any, name: str) -> Any:
-        """发现插件实例: 查找继承 Plugin 的类, 兜底兼容旧命名."""
-        # 1. isinstance 检查 (优先)
         for attr_name in dir(module):
             cls = getattr(module, attr_name, None)
             if isinstance(cls, type) and issubclass(cls, Plugin) and cls is not Plugin:
@@ -411,7 +437,6 @@ class PluginRegistry:
                 except Exception as e:
                     logger.error(f"failed to instantiate {attr_name}: {e}")
 
-        # 2. 兜底: 旧命名约定
         for attr_name in ("Plugin", "plugin", "Main"):
             cls = getattr(module, attr_name, None)
             if cls is not None and isinstance(cls, type):
@@ -478,7 +503,6 @@ class Host:
         plugin_name = params.get("plugin", "")
         spec = self.registry.plugins.get(plugin_name)
 
-        # 兜底: 按注册的第一个插件匹配
         if spec is None and self.registry.plugins:
             spec = next(iter(self.registry.plugins.values()))
             plugin_name = spec.name
@@ -534,8 +558,6 @@ class Host:
             self.rpc.send("event_reply", reply_data, msg_id)
 
     async def _call(self, handler: Callable, params: Dict[str, Any]) -> Any:
-        """调用 handler，自动适配签名: handler(params) 或 handler(sdk, params)。"""
-        # bound method: self 已绑定，只算其余参数
         sig = inspect.signature(handler)
         nparams = len(sig.parameters)
 
@@ -552,7 +574,6 @@ class Host:
 # ---- 入口 ----
 
 def main() -> int:
-    """单插件模式。Go 端通过 NEOBOT_META 环境变量注入元信息。"""
     plugin_dir = os.environ.get("NEOBOT_PLUGIN_DIR", "plugins_py")
     plugin_name = os.environ.get("NEOBOT_PLUGIN_NAME", "")
     meta_raw = os.environ.get("NEOBOT_META", "")

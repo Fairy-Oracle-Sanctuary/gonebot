@@ -4,9 +4,14 @@
 
 Lua 插件通过 Go 闭包直接在 Go 内存空间中被调用，无序列化开销。
 
-## Python: JSON-RPC over stdio
+## Python: 帧协议 over stdio
 
-Python 子进程与 Go 主进程通过 stdin/stdout 进行 JSON-RPC 通信。消息格式为逐行 JSON。
+Python 子进程与 Go 主进程通过 stdin/stdout 进行二进制帧通信。**帧格式: [4 字节大端 uint32 长度前缀] + [JSON payload]**。
+
+相比旧的行分隔 JSON 协议，帧协议优势：
+- **零扫描开销** — 读取固定 4 字节头即可确定载荷长度，无需逐字节扫描换行符
+- **直接 I/O** — 使用 `io.ReadFull` 一次性读取完整载荷，消除 `bufio.Reader` 中间层
+- **可靠分界** — 消息边界由长度明确界定，不受 JSON 内容中换行符干扰
 
 Go 通过 `NEOBOT_META` / `NEOBOT_PLUGIN_DIR` / `NEOBOT_PLUGIN_NAME` 环境变量向 Python 注入元信息。
 

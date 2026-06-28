@@ -3,17 +3,17 @@
 // 每个插件一个独立的 Python 子进程, 配独立 venv.
 //
 //	neobot-go
-//	  ├── pyplugin_host.py --plugin=echo    --venv=plugins_py/echo/venv
-//	  ├── pyplugin_host.py --plugin=pwebfetch --venv=plugins_py/webfetch/venv
-//	  └── pyplugin_host.py --plugin=pyecho   --venv=plugins_py/pyecho/venv
+//	  ├── pyplugin_host.py (env: NEOBOT_PLUGIN_NAME=echo)
+//	  ├── pyplugin_host.py (env: NEOBOT_PLUGIN_NAME=webfetch)
+//	  └── pyplugin_host.py (env: NEOBOT_PLUGIN_NAME=pyecho)
 //
-// 通信: JSON-RPC over stdio.
+// 通信: 帧协议 over stdio — 4 字节大端长度前缀 + JSON payload.
 package pythonproc
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,7 +27,10 @@ import (
 	"time"
 )
 
-// Protocol 与原 PythonRuntime 共用, 放这里方便引用.
+// 帧协议: 4 字节大端长度 + JSON payload
+const frameHeaderSize = 4
+
+// Envelope JSON 消息信封.
 type Envelope struct {
 	Method string          `json:"method"`
 	ID     string          `json:"id,omitempty"`
@@ -35,6 +38,7 @@ type Envelope struct {
 	Error  string          `json:"error,omitempty"`
 }
 
+// LogParams 日志参数.
 type LogParams struct {
 	Level string `json:"level"`
 	Msg   string `json:"msg"`
@@ -50,7 +54,7 @@ type Proc struct {
 	mu     sync.Mutex
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
-	stdout *bufio.Reader
+	stdout io.ReadCloser
 	logger *slog.Logger
 
 	pythonBin  string
@@ -58,16 +62,15 @@ type Proc struct {
 	pluginDir  string
 	pluginName string
 	VenvPath   string
-	metaJSON   string // 插件元信息 JSON
+	metaJSON   string
 
 	apiHandler APIHandler
 
 	pendingAPIs sync.Map // req_id → chan json.RawMessage
 	closed      chan struct{}
 
-	// ready 等待
 	readyCh      chan struct{}
-	ReadyPayload json.RawMessage // Python ready 载荷 (命令列表等)
+	ReadyPayload json.RawMessage
 }
 
 // Config 进程配置.
@@ -76,9 +79,9 @@ type Config struct {
 	ShimPath   string
 	PluginName string
 	PluginDir  string
-	VenvPath   string     // 留空表示使用系统 Python
-	MetaJSON   string     // 插件元信息 JSON (传给 Python 宿主)
-	APIHandler APIHandler // Python 插件调用的 API 处理器
+	VenvPath   string
+	MetaJSON   string
+	APIHandler APIHandler
 }
 
 // NewProc 创建子进程.
@@ -95,7 +98,7 @@ func NewProc(cfg Config) *Proc {
 	}
 }
 
-// Start 启动子进程并等待 init 确认.
+// Start 启动子进程.
 func (p *Proc) Start(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -105,7 +108,6 @@ func (p *Proc) Start(ctx context.Context) error {
 
 	python := p.pythonBin
 	if p.VenvPath != "" {
-		// 使用 venv 内 python
 		if runtime := os.Getenv("GOOS"); runtime == "windows" || runtime == "" {
 			python = filepath.Join(p.VenvPath, "Scripts", "python.exe")
 		} else {
@@ -115,8 +117,8 @@ func (p *Proc) Start(ctx context.Context) error {
 
 	parentDir := filepath.Dir(p.pluginDir)
 	dirName := filepath.Base(p.pluginDir)
-	args := []string{p.shimPath}
-	cmd := exec.CommandContext(ctx, python, args...)
+
+	cmd := exec.CommandContext(ctx, python, p.shimPath)
 	cmd.Dir = parentDir
 	cmd.Env = append(os.Environ(),
 		"PYTHONIOENCODING=utf-8",
@@ -140,7 +142,7 @@ func (p *Proc) Start(ctx context.Context) error {
 
 	p.cmd = cmd
 	p.stdin = stdin
-	p.stdout = bufio.NewReader(stdout)
+	p.stdout = stdout
 	p.closed = make(chan struct{})
 	p.readyCh = make(chan struct{})
 
@@ -154,6 +156,38 @@ func (p *Proc) Start(ctx context.Context) error {
 	return nil
 }
 
+// ---- 帧协议 I/O ----
+
+// writeFrame 向 stdin 写入一帧: [4 字节长度][JSON payload].
+func (p *Proc) writeFrame(data []byte) error {
+	lenBuf := make([]byte, frameHeaderSize)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
+	if _, err := p.stdin.Write(lenBuf); err != nil {
+		return err
+	}
+	_, err := p.stdin.Write(data)
+	return err
+}
+
+// readFrame 从 stdout 读取一帧, 返回 payload 字节.
+func (p *Proc) readFrame() ([]byte, error) {
+	lenBuf := make([]byte, frameHeaderSize)
+	if _, err := io.ReadFull(p.stdout, lenBuf); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint32(lenBuf)
+	if length > 64*1024*1024 { // 64MB 硬上限
+		return nil, fmt.Errorf("frame too large: %d", length)
+	}
+	data := make([]byte, length)
+	if _, err := io.ReadFull(p.stdout, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// ---- 消息处理 ----
+
 func (p *Proc) readLoop() {
 	for {
 		select {
@@ -162,7 +196,7 @@ func (p *Proc) readLoop() {
 		default:
 		}
 
-		line, err := p.stdout.ReadString('\n')
+		data, err := p.readFrame()
 		if err != nil {
 			if err != io.EOF {
 				p.logger.Warn("read error", "err", err.Error())
@@ -170,9 +204,10 @@ func (p *Proc) readLoop() {
 			p.logger.Info("subprocess exited")
 			return
 		}
+
 		var env Envelope
-		if err := json.Unmarshal([]byte(line), &env); err != nil {
-			p.logger.Warn("decode msg failed", "err", err.Error())
+		if err := json.Unmarshal(data, &env); err != nil {
+			p.logger.Warn("decode msg failed", "err", err.Error(), "raw", string(data))
 			continue
 		}
 		p.handle(&env)
@@ -202,7 +237,6 @@ func (p *Proc) handle(env *Envelope) {
 		}
 
 	case "call_api":
-		// Python 插件调用 Go 端 Bot API
 		var req struct {
 			Action string         `json:"action"`
 			Params map[string]any `json:"params"`
@@ -275,9 +309,7 @@ func (p *Proc) send(env Envelope) error {
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-	_, err = p.stdin.Write(data)
-	return err
+	return p.writeFrame(data)
 }
 
 // Stop 优雅停止.
@@ -311,7 +343,7 @@ func (p *Proc) Stop() error {
 	return nil
 }
 
-// PID 返回进程 ID (用于诊断).
+// PID 返回进程 ID.
 func (p *Proc) PID() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -321,7 +353,7 @@ func (p *Proc) PID() int {
 	return 0
 }
 
-// WaitReady 等待 Python 端发送 ready 消息, 返回载荷.
+// WaitReady 等待 Python 端 ready 消息.
 func (p *Proc) WaitReady(timeout time.Duration) (json.RawMessage, error) {
 	select {
 	case <-p.readyCh:
@@ -331,28 +363,20 @@ func (p *Proc) WaitReady(timeout time.Duration) (json.RawMessage, error) {
 	}
 }
 
-// 兼容旧接口 (PythonRuntime 沿用).
-
-// CallCommand 转发命令调用 (兼容旧接口).
-func (p *Proc) CallCommand(cmd string, args []string) any {
-	return p.CallCommandEx(cmd, args, nil)
-}
+// ---- 事件转发 ----
 
 // CallCommandEx 转发命令调用, 携带事件上下文.
 func (p *Proc) CallCommandEx(cmd string, args []string, evtCtx map[string]any) any {
-	argsJSON := mustJSON(args)
-	p.logger.Info("calling python command", "cmd", cmd, "args", args)
 	resp, err := p.Request("event", map[string]any{
 		"event":     "command",
 		"cmd":       cmd,
-		"args":      argsJSON,
+		"args":      mustJSON(args),
 		"event_ctx": evtCtx,
 	}, 30*time.Second)
 	if err != nil {
 		p.logger.Warn("call cmd failed", "cmd", cmd, "err", err.Error())
 		return nil
 	}
-	p.logger.Info("python command response", "cmd", cmd, "raw", string(resp))
 	var data struct {
 		Reply json.RawMessage `json:"reply"`
 		Error string          `json:"error"`
@@ -364,21 +388,13 @@ func (p *Proc) CallCommandEx(cmd string, args []string, evtCtx map[string]any) a
 	if len(data.Reply) > 0 {
 		var s string
 		if err := json.Unmarshal(data.Reply, &s); err == nil {
-			p.logger.Info("python command reply", "cmd", cmd, "reply", s)
 			return s
 		}
-		p.logger.Info("python command reply (non-string)", "cmd", cmd, "reply", string(data.Reply))
 	}
-	p.logger.Info("python command no reply", "cmd", cmd)
 	return nil
 }
 
-// CallMessageHook 转发消息 hook (兼容旧接口).
-func (p *Proc) CallMessageHook(text string) any {
-	return p.CallMessageHookEx(text, nil)
-}
-
-// CallMessageHookEx 转发消息 hook, 携带事件上下文.
+// CallMessageHookEx 转发消息 hook.
 func (p *Proc) CallMessageHookEx(text string, evtCtx map[string]any) any {
 	resp, err := p.Request("event", map[string]any{
 		"event":     "message",
@@ -401,12 +417,7 @@ func (p *Proc) CallMessageHookEx(text string, evtCtx map[string]any) any {
 	return nil
 }
 
-// CallNoticeHook 转发通知 hook (兼容旧接口).
-func (p *Proc) CallNoticeHook(noticeType string) {
-	p.CallNoticeHookEx(noticeType, nil)
-}
-
-// CallNoticeHookEx 转发通知 hook, 携带事件上下文.
+// CallNoticeHookEx 转发通知 hook.
 func (p *Proc) CallNoticeHookEx(noticeType string, evtCtx map[string]any) any {
 	resp, err := p.Request("event", map[string]any{
 		"event":      "notice",
@@ -416,7 +427,6 @@ func (p *Proc) CallNoticeHookEx(noticeType string, evtCtx map[string]any) any {
 	if err != nil {
 		return nil
 	}
-	// 通知 hook 可能返回 reply
 	var data struct {
 		Reply json.RawMessage `json:"reply"`
 	}
