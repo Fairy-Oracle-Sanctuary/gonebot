@@ -268,7 +268,7 @@ func (c *Client) logEvent(ev *event.Any) {
 	case event.PostMessage:
 		m := ev.Message
 		if m != nil {
-			c.logger.Info("event received",
+			c.logger.Debug("event received",
 				"type", "message",
 				"message_type", m.MessageType,
 				"user_id", m.UserID,
@@ -279,7 +279,7 @@ func (c *Client) logEvent(ev *event.Any) {
 	case event.PostNotice:
 		n := ev.Notice
 		if n != nil {
-			c.logger.Info("event received",
+			c.logger.Debug("event received",
 				"type", "notice",
 				"notice_type", n.NoticeType,
 				"user_id", n.UserID,
@@ -300,7 +300,7 @@ func (c *Client) logEvent(ev *event.Any) {
 	case event.PostMeta:
 		m := ev.Meta
 		if m != nil {
-			c.logger.Info("event received",
+			c.logger.Debug("event received",
 				"type", "meta_event",
 				"meta_type", m.MetaEventType,
 			)

@@ -46,7 +46,7 @@ func (r *Router) Dispatch(ctx context.Context, ev *event.Any) {
 		if m.UserID != 0 && m.SelfID != 0 && m.UserID == m.SelfID {
 			return
 		}
-		r.logger.Info("dispatch message",
+		r.logger.Debug("dispatch message",
 			"message_type", string(m.MessageType),
 			"user_id", m.UserID,
 			"group_id", m.GroupID,
@@ -84,26 +84,23 @@ func (r *Router) Dispatch(ctx context.Context, ev *event.Any) {
 		if cmd == "" {
 			return
 		}
-		r.logger.Info("looking up command", "cmd", cmd)
 		if entry, _ := r.registry.LookupCommand(cmd); entry != nil {
-			r.logger.Info("command matched", "cmd", cmd, "plugin", entry.Plugin)
+			r.logger.Info("command matched", "cmd", cmd, "plugin", entry.Plugin, "args", parseArgs(text))
 			// 权限检查
 			if !r.checkPerm(m, entry) {
-				r.logger.Debug("permission denied",
+				r.logger.Warn("permission denied",
 					"plugin", entry.Plugin, "command", entry.Name,
 					"user_id", m.UserID, "group_id", m.GroupID)
 				r.sendReply(ctx, m, "权限不足")
 				return
 			}
-			args := parseArgs(text)
-			r.logger.Info("calling command handler", "cmd", cmd, "args", args)
-			if reply := entry.Handler(args); reply != nil {
+			if reply := entry.Handler(parseArgs(text)); reply != nil {
 				r.sendReply(ctx, m, reply)
 			} else {
-				r.logger.Info("command handler returned nil", "cmd", cmd)
+				r.logger.Debug("command handler returned nil", "cmd", cmd)
 			}
 		} else {
-			r.logger.Info("command not found in registry", "cmd", cmd)
+			r.logger.Debug("command not found in registry", "cmd", cmd)
 		}
 
 	case event.PostNotice:
@@ -111,7 +108,7 @@ func (r *Router) Dispatch(ctx context.Context, ev *event.Any) {
 		if n == nil {
 			return
 		}
-		r.logger.Info("dispatch notice",
+		r.logger.Debug("dispatch notice",
 			"notice_type", string(n.NoticeType),
 			"user_id", n.UserID,
 			"group_id", n.GroupID,

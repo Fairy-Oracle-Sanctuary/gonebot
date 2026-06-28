@@ -84,7 +84,13 @@ var zhMessages = map[string]string{
 	"lua call failed": "Lua 调用失败",
 
 	// === internal/plugin/router.go ===
-	"permission denied": "权限不足",
+	"permission denied":             "权限不足",
+	"command handler returned nil":  "命令处理器返回空",
+	"command not found in registry": "命令未注册",
+	"dispatch message":              "分发消息",
+	"dispatch notice":               "分发通知",
+	"command matched":               "匹配命令",
+	"replying":                      "回复消息",
 
 	// === internal/plugin/watcher.go ===
 	"watcher started":         "文件监控已启动",
