@@ -2,31 +2,44 @@
 
 Python 插件通过 `neobot_sdk` 包访问 SDK。每个 Python 插件在独立子进程中运行，通过 JSON-RPC over stdio 与 Go 核心通信。
 
+- 元信息由 Go 注入 `NEOBOT_META` 环境变量
+- 继承 `neobot_sdk.Plugin` 的类会被自动发现并实例化
+- 所有 `@command` 装饰器的命令名和别名都会注册到 Go Registry
+
 ## 入口文件
 
 ```python
-from neobot_sdk import command, on_message, on_notice
+from neobot_sdk import Plugin, command, on_message, on_notice
 
-class Plugin:
-    """插件类 - 框架自动实例化"""
+class MyPlugin(Plugin):
+    """继承 neobot_sdk.Plugin 即可被自动发现"""
 
-    @command(name="pycmd", aliases=["pc"])
+    async def on_init(self):
+        """可选: 初始化钩子, 加载后自动调用"""
+        pass
+
+    @command(name="pycmd", aliases=["pc"], permission="admin")
     async def my_command(self, sdk, params):
         args = params.get("args", [])
         return f"收到: {' '.join(args)}"
+
+    @command(name="hello")
+    async def hello(self, sdk, params):
+        return "Hello World!"
 
     @on_message
     async def on_text(self, sdk, params):
         text = params.get("text", "")
         if "python" in text.lower():
             return "[基于关键词的检测]"
-        return None
 
     @on_notice
     async def on_notify(self, sdk, params):
         notice_type = params.get("noticeType", "")
         sdk.log.info(f"通知: {notice_type}")
 ```
+
+> **注意**: 一个插件可以注册多个 `@command`，命令名无需与 `plugin.toml` 的 `name` 保持一致。所有命令名和别名会自动注册到 Go 端的 Registry。
 
 ## 装饰器
 
@@ -83,20 +96,17 @@ async def handler(self, sdk, params: dict) -> None:
 from neobot_sdk import Plugin
 ```
 
+**继承 `Plugin` 的类会被宿主自动发现并实例化。** 无需使用特定类名。
+
 ```python
 class Plugin:
-    name: str = ""            # 插件名
-    version: str = "1.0.0"    # 版本
-    description: str = ""     # 描述
-
-    async def on_init(self) -> None:      # 初始化钩子 (可选)
+    async def on_init(self) -> None:
+        """初始化钩子 - 实例化后自动调用。如果返回协程则自动调度。"""
         ...
 
-    async def on_shutdown(self) -> None:   # 关闭钩子 (可选)
+    async def on_shutdown(self) -> None:
+        """关闭钩子 - 子进程退出前调用 (可选)。"""
         ...
-
-    def get_meta(self) -> dict:           # 获取元信息
-        return {"name": ..., "version": ..., "description": ...}
 ```
 
 ## sdk 对象

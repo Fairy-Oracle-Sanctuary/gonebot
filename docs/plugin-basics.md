@@ -48,7 +48,7 @@ local = ["./lib"]             # 本地路径
 ## 插件生命周期
 
 ```
-启动阶段:
+启动阶段 (Go 侧):
   1. Manager.LoadAll() 扫描插件目录
   2. LoadMetadata() 读取 plugin.toml
   3. 根据 runtime 字段创建对应的 Runtime
@@ -60,13 +60,17 @@ Lua 加载:
   c. L.DoFile() 执行 plugin.lua
   d. plugin.lua 中调用 neobot.register.* 完成注册
 
-Python 加载:
-  a. 检查并安装 [dependencies].python
-  b. 创建 venv (如果启用)
-  c. 启动子进程: python pyplugin_host.py --plugin=<name> --plugin-dir=<dir>
-  d. 子进程加载 plugin.py，扫描 @command/@on_message/@on_notice
-  e. 子进程发送 ready 确认就绪
-  f. Go 端收到 ready 后注册命令和 Hook
+Python 加载 (简化后):
+  a. Go 检查并安装 [dependencies].python
+  b. Go 注入 NEOBOT_META 环境变量 (含 name/version/config 等)
+  c. Go 启动子进程: python pyplugin_host.py
+     - 不再需要 --plugin/--plugin-dir 参数
+  d. Python 宿主加载 plugin.py
+     - 自动发现继承 neobot_sdk.Plugin 的类
+     - 扫描 @command/@on_message/@on_notice 装饰器
+     - 调用 on_init() 钩子
+  e. Python 发送 ready 载荷 (含全部命令列表、别名、权限)
+  f. Go 等待 ready, 根据载荷注册所有命令到 Registry
 
 运行时:
   - 事件到达 → Router.Dispatch() → 匹配命令/Hook → 调用 handler
@@ -81,6 +85,13 @@ Python 加载:
   b. Lua: L.Close() 关闭 VM
   c. Python: 发送 shutdown → 等待退出 → KILL
 ```
+
+### Python 插件简化点
+
+- **元信息由 Go 注入** — Python 端不再重复解析 `plugin.toml`，所有元信息通过 `NEOBOT_META` 环境变量传递
+- **类自动发现** — 优先查找继承 `neobot_sdk.Plugin` 的类，兜底兼容旧命名 `Plugin / plugin / Main`
+- **多命令原生支持** — 所有 `@command` 装饰器注册的命令名和别名都写入 Go Registry，无需与 `plugin.toml` 的 `name` 保持一致
+- **`on_init()` 钩子** — 插件实例化后自动调用，如果返回协程则自动调度
 
 ## 权限系统
 
