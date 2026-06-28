@@ -13,8 +13,8 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"time"
 
-	"neobot/core/internal/event"
 	"neobot/core/internal/permission"
 	"neobot/core/internal/plugin/pythonproc"
 )
@@ -29,10 +29,10 @@ type PythonRuntime struct {
 
 	mu     sync.RWMutex
 	procs  map[string]*pythonproc.Proc
-	loaded map[string]*PluginInfo
+	loaded map[string]*Metadata
 
 	registry    RegistrySubset
-	currentHost *Host // 当前宿主引用 (用于读取 EventCtx 和 Bot)
+	currentHost *Host
 }
 
 // PythonConfig 配置.
@@ -61,7 +61,7 @@ func NewPythonRuntime(cfg PythonConfig) *PythonRuntime {
 		shimPath:       cfg.ShimPath,
 		sharedVenvPath: cfg.SharedVenvPath,
 		procs:          make(map[string]*pythonproc.Proc),
-		loaded:         make(map[string]*PluginInfo),
+		loaded:         make(map[string]*Metadata),
 		logger:         slog.Default().With("module", "python.runtime"),
 	}
 }
@@ -112,13 +112,26 @@ func (r *PythonRuntime) Load(ctx context.Context, host *Host, dir, entry string,
 		}
 	}
 
-	// 2. 创建子进程 (传入 APIHandler = 自己)
+	// 2. 创建子进程 (传入元信息)
+	metaJSON, err := json.Marshal(map[string]any{
+		"name":        meta.Name,
+		"version":     meta.Version,
+		"description": meta.Description,
+		"author":      meta.Author,
+		"permission":  meta.Permission,
+		"config":      meta.Config,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal meta for %s: %w", meta.Name, err)
+	}
+
 	proc := pythonproc.NewProc(pythonproc.Config{
 		PythonBin:  r.pythonBin,
 		ShimPath:   r.shimPath,
 		PluginName: meta.Name,
 		PluginDir:  dir,
 		VenvPath:   venvPath,
+		MetaJSON:   string(metaJSON),
 		APIHandler: r,
 	})
 
@@ -128,48 +141,18 @@ func (r *PythonRuntime) Load(ctx context.Context, host *Host, dir, entry string,
 
 	r.mu.Lock()
 	r.procs[meta.Name] = proc
-	r.loaded[meta.Name] = &PluginInfo{
-		Name:        meta.Name,
-		Version:     meta.Version,
-		Description: meta.Description,
-		Permission:  meta.Permission,
-	}
+	r.loaded[meta.Name] = meta
 	r.mu.Unlock()
 
-	// 3. 注册命令和 hooks (使用闭包捕获 host.EventCtx)
+	// 3. 等待 Python ready 并注册命令
+	rawReady, err := proc.WaitReady(10 * time.Second)
+	if err != nil {
+		_ = proc.Stop()
+		return fmt.Errorf("wait ready for %s: %w", meta.Name, err)
+	}
+
 	if host.Registry != nil {
-		pluginName := meta.Name
-		required := permission.ParseLevelSimple(meta.Permission)
-
-		host.Registry.RegisterCommand(pluginName, pluginName, nil, required, func(args []string) any {
-			proc := r.getProc(pluginName)
-			if proc == nil {
-				return "plugin not loaded"
-			}
-			// 构造事件上下文传给 Python
-			evtCtx := r.buildEventCtx()
-			return proc.CallCommandEx(pluginName, args, evtCtx)
-		})
-
-		// 消息 hook
-		host.Registry.RegisterMessageHook(pluginName, func(text string) any {
-			proc := r.getProc(pluginName)
-			if proc == nil {
-				return nil
-			}
-			evtCtx := r.buildEventCtx()
-			return proc.CallMessageHookEx(text, evtCtx)
-		})
-
-		// 通知 hook (noticeType 从 EventCtx 的 RawMessage 取)
-		host.Registry.RegisterNoticeHook(pluginName, "*", func(noticeType string) any {
-			proc := r.getProc(pluginName)
-			if proc == nil {
-				return nil
-			}
-			evtCtx := r.buildEventCtx()
-			return proc.CallNoticeHookEx(noticeType, evtCtx)
-		})
+		r.registerFromReady(host.Registry, meta.Name, rawReady, proc)
 	}
 
 	r.logger.Info("plugin ready (isolated proc)",
@@ -246,39 +229,73 @@ func (r *PythonRuntime) Close() error {
 	return nil
 }
 
-// 保留 stage1 协议结构.
+// ---- ready payload ----
 
-type RPCMethod = string
-
-type Envelope struct {
-	Method RPCMethod       `json:"method"`
-	ID     string          `json:"id,omitempty"`
-	Params json.RawMessage `json:"params,omitempty"`
-	Error  string          `json:"error,omitempty"`
+type ReadyPayload struct {
+	Plugins []ReadyPlugin `json:"plugins"`
 }
 
-type InitParams struct {
-	PluginDir string `json:"plugin_dir"`
+type ReadyPlugin struct {
+	Name           string         `json:"name"`
+	Commands       []ReadyCommand `json:"commands"`
+	HasMessageHook bool           `json:"has_message_hook"`
+	HasNoticeHook  bool           `json:"has_notice_hook"`
 }
 
-type ReadyResult struct {
-	Plugins []PluginInfo `json:"plugins"`
+type ReadyCommand struct {
+	Name       string   `json:"name"`
+	Permission string   `json:"permission"`
+	Aliases    []string `json:"aliases"`
 }
 
-type PluginInfo struct {
-	Name           string   `json:"name"`
-	Version        string   `json:"version"`
-	Description    string   `json:"description"`
-	Commands       []string `json:"commands"`
-	Permission     string   `json:"permission"`
-	HasMessageHook bool     `json:"has_message_hook"`
-	HasNoticeHook  bool     `json:"has_notice_hook"`
+// registerFromReady 根据 Python ready 载荷注册所有命令和 Hook.
+func (r *PythonRuntime) registerFromReady(reg RegistrySubset, pluginName string, raw json.RawMessage, proc *pythonproc.Proc) {
+	var payload ReadyPayload
+	if err := json.Unmarshal(raw, &payload); err != nil || len(payload.Plugins) == 0 {
+		r.logger.Warn("failed to parse ready payload, fallback to single command", "plugin", pluginName)
+		reg.RegisterCommand(pluginName, pluginName, nil, permission.User, r.makeCmdHandler(pluginName, pluginName, proc))
+		return
+	}
+
+	info := payload.Plugins[0]
+
+	// 注册每个命令 (含别名)
+	for _, cmd := range info.Commands {
+		perm := permission.ParseLevelSimple(cmd.Permission)
+		reg.RegisterCommand(pluginName, cmd.Name, cmd.Aliases, perm, r.makeCmdHandler(pluginName, cmd.Name, proc))
+		r.logger.Debug("registered python command", "plugin", pluginName, "cmd", cmd.Name, "aliases", cmd.Aliases, "perm", perm)
+	}
+
+	// 消息 Hook
+	if info.HasMessageHook {
+		reg.RegisterMessageHook(pluginName, func(text string) any {
+			p := r.getProc(pluginName)
+			if p == nil {
+				return nil
+			}
+			return p.CallMessageHookEx(text, r.buildEventCtx())
+		})
+	}
+
+	// 通知 Hook
+	if info.HasNoticeHook {
+		reg.RegisterNoticeHook(pluginName, "*", func(noticeType string) any {
+			p := r.getProc(pluginName)
+			if p == nil {
+				return nil
+			}
+			return p.CallNoticeHookEx(noticeType, r.buildEventCtx())
+		})
+	}
 }
 
-func mustJSON(v any) json.RawMessage {
-	data, _ := json.Marshal(v)
-	return data
+// makeCmdHandler 创建命令 handler 闭包.
+func (r *PythonRuntime) makeCmdHandler(pluginName, cmdName string, proc *pythonproc.Proc) func(args []string) any {
+	return func(args []string) any {
+		p := r.getProc(pluginName)
+		if p == nil {
+			return "plugin not loaded"
+		}
+		return p.CallCommandEx(cmdName, args, r.buildEventCtx())
+	}
 }
-
-var _ = event.Any{}
-var _ = errors.New

@@ -25,8 +25,6 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
-	"neobot/core/internal/event"
 )
 
 // Protocol 与原 PythonRuntime 共用, 放这里方便引用.
@@ -59,12 +57,17 @@ type Proc struct {
 	shimPath   string
 	pluginDir  string
 	pluginName string
-	VenvPath   string // 可选 (阶段 2: venv 隔离)
+	VenvPath   string
+	metaJSON   string // 插件元信息 JSON
 
-	apiHandler APIHandler // Go 端 API 处理器 (bot/send/...)
+	apiHandler APIHandler
 
 	pendingAPIs sync.Map // req_id → chan json.RawMessage
 	closed      chan struct{}
+
+	// ready 等待
+	readyCh      chan struct{}
+	ReadyPayload json.RawMessage // Python ready 载荷 (命令列表等)
 }
 
 // Config 进程配置.
@@ -74,6 +77,7 @@ type Config struct {
 	PluginName string
 	PluginDir  string
 	VenvPath   string     // 留空表示使用系统 Python
+	MetaJSON   string     // 插件元信息 JSON (传给 Python 宿主)
 	APIHandler APIHandler // Python 插件调用的 API 处理器
 }
 
@@ -85,6 +89,7 @@ func NewProc(cfg Config) *Proc {
 		pluginDir:  cfg.PluginDir,
 		pluginName: cfg.PluginName,
 		VenvPath:   cfg.VenvPath,
+		metaJSON:   cfg.MetaJSON,
 		apiHandler: cfg.APIHandler,
 		logger:     slog.Default().With("module", "pythonproc", "plugin", cfg.PluginName),
 	}
@@ -108,15 +113,20 @@ func (p *Proc) Start(ctx context.Context) error {
 		}
 	}
 
-	parentDir := filepath.Dir(p.pluginDir) // "plugins_py"
-	dirName := filepath.Base(p.pluginDir)  // "echo" (目录名, 非 toml name)
-	args := []string{p.shimPath, "--plugin", dirName, "--plugin-dir", parentDir}
+	parentDir := filepath.Dir(p.pluginDir)
+	dirName := filepath.Base(p.pluginDir)
+	args := []string{p.shimPath}
 	cmd := exec.CommandContext(ctx, python, args...)
 	cmd.Dir = parentDir
 	cmd.Env = append(os.Environ(),
 		"PYTHONIOENCODING=utf-8",
 		"PYTHONUNBUFFERED=1",
+		"NEOBOT_PLUGIN_DIR="+parentDir,
+		"NEOBOT_PLUGIN_NAME="+dirName,
 	)
+	if p.metaJSON != "" {
+		cmd.Env = append(cmd.Env, "NEOBOT_META="+p.metaJSON)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -132,6 +142,7 @@ func (p *Proc) Start(ctx context.Context) error {
 	p.stdin = stdin
 	p.stdout = bufio.NewReader(stdout)
 	p.closed = make(chan struct{})
+	p.readyCh = make(chan struct{})
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start python: %w (is python installed?)", err)
@@ -172,6 +183,8 @@ func (p *Proc) handle(env *Envelope) {
 	switch env.Method {
 	case "ready":
 		p.logger.Info("plugin ready (ready received)")
+		p.ReadyPayload = env.Params
+		close(p.readyCh)
 
 	case "log":
 		var lp LogParams
@@ -308,6 +321,16 @@ func (p *Proc) PID() int {
 	return 0
 }
 
+// WaitReady 等待 Python 端发送 ready 消息, 返回载荷.
+func (p *Proc) WaitReady(timeout time.Duration) (json.RawMessage, error) {
+	select {
+	case <-p.readyCh:
+		return p.ReadyPayload, nil
+	case <-time.After(timeout):
+		return nil, errors.New("timeout waiting for plugin ready")
+	}
+}
+
 // 兼容旧接口 (PythonRuntime 沿用).
 
 // CallCommand 转发命令调用 (兼容旧接口).
@@ -406,26 +429,6 @@ func (p *Proc) CallNoticeHookEx(noticeType string, evtCtx map[string]any) any {
 	}
 	return nil
 }
-
-// RegisterCommands 通知 Python 端注册命令 (Python 端启动时会自动扫描, 这里只是可选显式注册).
-func (p *Proc) RegisterCommands(commands []CommandInfo, hasMsgHook, hasNoticeHook bool) error {
-	return p.Send("register", map[string]any{
-		"plugin":       p.pluginName,
-		"commands":     commands,
-		"message_hook": hasMsgHook,
-		"notice_hook":  hasNoticeHook,
-	})
-}
-
-// CommandInfo 命令元信息.
-type CommandInfo struct {
-	Name       string   `json:"name"`
-	Permission string   `json:"permission"`
-	Aliases    []string `json:"aliases"`
-}
-
-// 抑制未使用告警.
-var _ = event.Any{}
 
 func mustJSON(v any) json.RawMessage {
 	data, _ := json.Marshal(v)
