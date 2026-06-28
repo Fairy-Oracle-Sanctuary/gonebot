@@ -72,13 +72,20 @@ end)
 **Python** (`plugins_py/<name>/plugin.py`)：
 
 ```python
-from neobot_sdk import command, on_message
+from neobot_sdk import Plugin, command, on_message
 
-class Plugin:
+class MyPlugin(Plugin):
+    async def on_init(self):
+        """初始化钩子, 加载后自动调用"""
+
     @command(name="pyhello", aliases=["phi"])
     async def hello(self, sdk, params):
         args = params.get("args", [])
         return f"Hello, {args[0] or 'World'}!"
+
+    @command(name="ping")
+    async def ping(self, sdk, params):
+        return "Pong!"
 
     @on_message
     async def on_text(self, sdk, params):
