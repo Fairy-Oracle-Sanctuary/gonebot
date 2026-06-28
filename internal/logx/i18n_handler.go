@@ -45,6 +45,9 @@ func detectLocale() Locale {
 			return ZH
 		}
 	}
+	if detectWindowsLocale() == ZH {
+		return ZH
+	}
 	return EN
 }
 

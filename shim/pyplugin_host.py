@@ -33,11 +33,57 @@ if str(_shim_dir) not in sys.path:
 from neobot_sdk.plugin import Plugin, command, on_message, on_notice  # noqa: E402
 
 logger = logging.getLogger("pyplugin_host")
+
+# ---- 语言检测 ----
+
+def _is_zh() -> bool:
+    """检测是否为中文环境."""
+    for key in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        v = os.environ.get(key, "").lower()
+        if v.startswith("zh"):
+            return True
+    # Windows: 尝试 ctypes 检测 UI 语言
+    try:
+        import ctypes
+        lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+        if lang_id in (0x0804, 0x0404, 0x0c04, 0x1004):
+            return True
+    except Exception:
+        pass
+    return False
+
+_ZH = _is_zh()
+
+
+class _I18nFormatter(logging.Formatter):
+    """人类可读日志: HH:MM:SS.mmm LEVEL module message"""
+
+    def __init__(self):
+        super().__init__(datefmt="%H:%M:%S")
+
+    def formatTime(self, record, datefmt=None):
+        from datetime import datetime
+        dt = datetime.fromtimestamp(record.created)
+        return dt.strftime("%H:%M:%S.") + f"{int(dt.microsecond / 1000):03d}"
+
+    def format(self, record):
+        ts = self.formatTime(record)
+        if _ZH:
+            levels = {"DEBUG": "调试", "INFO": "信息", "WARNING": "警告", "ERROR": "错误"}
+            lvl = levels.get(record.levelname, record.levelname)
+        else:
+            lvl = record.levelname[:4].upper()
+        msg = record.getMessage()
+        return f"\033[90m{ts}\033[0m \033[32m{lvl:>4s}\033[0m {msg}\n"
+
+
 logging.basicConfig(
     level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    format="%(message)s",
     stream=sys.stderr,
 )
+for h in logging.getLogger().handlers:
+    h.setFormatter(_I18nFormatter())
 
 # 帧协议常量
 FRAME_HEADER_SIZE = 4      # 4 字节大端 uint32
